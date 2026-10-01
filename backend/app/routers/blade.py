@@ -1,9 +1,8 @@
 """叶片接口：维护叶片，覆盖提交检查、登记缺陷、更换叶片等动作。"""
 from __future__ import annotations
 
-from typing import Any
-
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import JSONResponse
 
 from app.schemas import ActionResult, EntryPayload, PageResult
 from app.services.blade import BladeService
@@ -24,10 +23,47 @@ def list_entries(
     size: int = 20,
 ) -> PageResult[dict]:
     """按叶片编号与状态过滤叶片列表；没有数据时返回空页，不报错。"""
-    if size > 200:
-        raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
-    items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
+    if page < 1:
+        raise HTTPException(status_code=400, detail="页码需从 1 开始")
+    if size < 1 or size > 200:
+        raise HTTPException(status_code=400, detail="每页条数需在 1~200 之间，请缩小分页范围")
+    try:
+        items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return PageResult(items=items, total=total, page=page, size=size)
+
+
+# 注意：固定路径（export / stats）必须声明在 /{entry_id} 之前，
+# 否则 FastAPI 会把 "export" 当成 entry_id 解析成整数而返回 422。
+@router.get("/export")
+def export_entries(
+    keyword: str | None = Query(default=None, description="按叶片编号检索"),
+    status: str | None = Query(default=None, description="待检查、完好、存在裂纹、已更换"),
+) -> JSONResponse:
+    """导出叶片清单：返回当前过滤条件下的全量数据，并以附件形式下载。"""
+    try:
+        items, total = service.list_entries(keyword=keyword, status=status, page=1, size=10000)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"导出条件不被接受：{exc}") from exc
+    payload = {"module": "blade", "total": total, "items": items}
+    return JSONResponse(
+        payload,
+        headers={"Content-Disposition": 'attachment; filename="blade_export.json"'},
+    )
+
+
+@router.get("/stats")
+def get_stats() -> dict[str, object]:
+    """叶片统计：待检查、存在裂纹、本月更换数，全部实时计算。"""
+    return {"items": service.stats()}
+
+
+@router.post("/clear", response_model=ActionResult)
+def clear_entries() -> ActionResult:
+    """清空叶片检查记录；台账定级保留，重新登记同一编号时沿用。"""
+    count = service.clear_entries()
+    return ActionResult(ok=True, message=f"已清空 {count} 条叶片检查记录，叶片台账定级已保留")
 
 
 @router.get("/{entry_id}", response_model=dict)
@@ -42,10 +78,12 @@ def get_entry(entry_id: int) -> dict:
 @router.post("", response_model=ActionResult)
 def create_entry(payload: EntryPayload) -> ActionResult:
     """登记一条叶片，缺字段时说明原因而不是静默丢弃。"""
-    entry, missing = service.create_entry(payload.values)
+    entry, missing, message = service.create_entry(payload.values)
     if missing:
         return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(missing)}")
-    return ActionResult(ok=True, message="叶片已登记", entry=entry)
+    if entry is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=entry)
 
 
 @router.post("/{entry_id}/actions", response_model=ActionResult)
@@ -56,10 +94,3 @@ def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
     if entry is None:
         return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=message, entry=entry)
-
-
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出叶片清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "blade", "total": total, "items": items}
